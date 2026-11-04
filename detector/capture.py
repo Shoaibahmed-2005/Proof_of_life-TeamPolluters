@@ -130,26 +130,74 @@ def list_cameras(max_index: int = 8) -> list[tuple[int, str]]:
     return found
 
 
-def _open(source: int | str, want_fps: float = 30.0, want_width: int = 1280):
+def _open(
+    source: int | str,
+    want_fps: float = 30.0,
+    want_width: int = 1280,
+    compressed: bool = True,
+    lock_exposure: bool = False,
+):
     import cv2
 
     if isinstance(source, int):
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(source, backend)
         if cap.isOpened():
-            # Many USB webcams default to uncompressed YUY2, which the bus can
-            # only sustain at 15-16 fps. MJPG usually unlocks the full frame
-            # rate. Frame rate matters here: the pulse is sampled per frame, so
-            # half the frames is half the evidence in the same window.
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
+            if compressed:
+                # Many USB webcams default to uncompressed YUY2, which the bus
+                # sustains at only 15-16 fps. MJPG usually unlocks the full
+                # frame rate — but it is lossy, and it compresses chroma
+                # hardest, which is exactly where the pulse lives. Use --raw
+                # to trade frame rate back for colour fidelity.
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(want_width * 9 / 16))
             cap.set(cv2.CAP_PROP_FPS, want_fps)
+
+            # Auto-exposure and auto-white-balance are genuinely bad for rPPG:
+            # they continuously rewrite the brightness and colour of the very
+            # signal being measured, on the same timescale as a heartbeat. The
+            # Android app locks both before scanning.
+            #
+            # But locking them through OpenCV is OFF by default, because on
+            # many webcams it does not work and fails destructively. This
+            # machine's camera reports CAP_PROP_AUTO_EXPOSURE as -1.00, i.e.
+            # unsupported — and setting it anyway dropped mean luma from 133
+            # to 20 and face-detection confidence from 0.94 to 0.20. These
+            # settings are also sticky in the driver, so they persist into
+            # other applications until reset.
+            #
+            # A dark frame is worse than a drifting one: the detector's
+            # off-skin control regions already catch illumination artifacts
+            # and report them rather than guessing. Try --lock-exposure only
+            # on a camera known to support manual control, and check the
+            # reported auto_exposure value afterwards.
+            if lock_exposure:
+                cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+            else:
+                cap.set(cv2.CAP_PROP_AUTO_WB, 1)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
+                cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
     else:
         cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source {source!r}")
     return cap
+
+
+def describe_source(cap) -> str:
+    """What the driver actually gave us, which is rarely what was asked for."""
+    import cv2
+
+    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    codec = "".join(chr((fourcc >> (8 * i)) & 0xFF) for i in range(4)).strip() or "?"
+    return (
+        f"{cap.get(cv2.CAP_PROP_FRAME_WIDTH):.0f}x{cap.get(cv2.CAP_PROP_FRAME_HEIGHT):.0f} "
+        f"codec={codec} auto_wb={cap.get(cv2.CAP_PROP_AUTO_WB):.2f} "
+        f"auto_exposure={cap.get(cv2.CAP_PROP_AUTO_EXPOSURE):.2f}"
+    )
 
 
 class BlankCameraError(RuntimeError):
@@ -190,6 +238,9 @@ def capture(
     min_region_coverage: float = 0.9,
     show: bool = False,
     progress: bool = True,
+    compressed: bool = True,
+    lock_exposure: bool = False,
+    width: int = 1280,
 ) -> CaptureResult:
     """
     Samples region colour traces from a camera or a video file.
@@ -211,7 +262,11 @@ def capture(
     """
     import cv2
 
-    cap = _open(source)
+    cap = _open(
+        source, compressed=compressed, lock_exposure=lock_exposure, want_width=width
+    )
+    if progress and isinstance(source, int):
+        print(f"  camera: {describe_source(cap)}")
     tracker = FaceTracker()
     layout_roles = roles_for()
 
@@ -359,6 +414,20 @@ def _main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save", type=str, default=None, help="write the time series to an .npz")
     parser.add_argument("--load", type=str, default=None, help="analyse a saved .npz instead")
     parser.add_argument("--show", action="store_true", help="show the frame with region boxes")
+    parser.add_argument(
+        "--raw", action="store_true",
+        help="skip MJPG: lower frame rate, but no lossy chroma compression",
+    )
+    parser.add_argument(
+        "--width", type=int, default=1280,
+        help="capture width; 640 often trades resolution for a higher frame "
+             "rate, which rPPG values more",
+    )
+    parser.add_argument(
+        "--lock-exposure", action="store_true",
+        help="lock auto-exposure and white balance; only on cameras that "
+             "support manual control, and check the reported auto_exposure",
+    )
     parser.add_argument("--list-cameras", action="store_true", help="list openable cameras and exit")
     args = parser.parse_args(argv)
 
@@ -379,7 +448,11 @@ def _main(argv: list[str] | None = None) -> int:
         source: int | str = args.video if args.video else args.source
         print(f"Capturing from {source!r} for {args.seconds:.0f}s ...")
         try:
-            result = capture(source=source, seconds=args.seconds, show=args.show)
+            result = capture(
+                source=source, seconds=args.seconds, show=args.show,
+                compressed=not args.raw, lock_exposure=args.lock_exposure,
+                width=args.width,
+            )
         except BlankCameraError as exc:
             print(f"\n{exc}")
             return 2
