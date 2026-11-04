@@ -106,8 +106,14 @@ class FaceTracker:
         self,
         smoothing: float = 0.35,
         dead_zone_px: float = 1.5,
-        max_coast_frames: int = 15,
-        score_threshold: float = 0.7,
+        max_coast_frames: int = 20,
+        # 0.7 is a sensible floor when the cost of a wrong face is high. Here
+        # the subject is cooperative and framed deliberately, while a rejected
+        # frame is a hole in the pulse signal — so the cost is reversed. At
+        # 0.7 a real, well-framed face was being dropped on most frames of a
+        # 24-second capture; borderline detections are worth keeping, and the
+        # EMA smoothing absorbs the occasional poor box.
+        score_threshold: float = 0.5,
         model_path: Path | None = None,
     ) -> None:
         import cv2

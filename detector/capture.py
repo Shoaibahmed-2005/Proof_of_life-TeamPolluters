@@ -204,31 +204,53 @@ class BlankCameraError(RuntimeError):
     """The camera streams, but the frames carry no image."""
 
 
-def _check_frames_have_content(frames: list[np.ndarray], min_std: float = 2.0) -> None:
+def _wait_for_stream(cap, min_std: float = 2.0, max_frames: int = 90) -> list[np.ndarray]:
     """
-    Rejects a stream of flat frames before wasting a whole capture on it.
+    Reads until the camera is actually producing an image, then returns the
+    frames read.
 
-    A covered lens, a camera kill switch or a privacy setting all produce
-    frames that arrive on time and contain nothing. Without this check the
-    capture runs its full length and then blames the user's face or lighting,
-    which sends them looking in exactly the wrong place.
+    Two different things look identical for the first few frames: a camera
+    that is simply slow to start, and one that will never produce an image at
+    all. A phone attached over USB can take two seconds and dozens of black
+    frames before it streams; a covered lens looks the same and never
+    improves. So this waits, rather than judging on a fixed number of frames —
+    an earlier version read 12 and declared a perfectly good phone camera
+    blank.
+
+    It also serves as auto-exposure settling time: sampling during that ramp
+    would put a brightness slope straight into the pulse band.
+
+    Raises:
+        BlankCameraError: if no frame in the window carried an image.
     """
     import cv2
 
-    if not frames:
-        return
-    spreads = [float(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).std()) for f in frames]
-    if max(spreads) < min_std:
-        mean_luma = float(cv2.cvtColor(frames[-1], cv2.COLOR_BGR2GRAY).mean())
+    frames: list[np.ndarray] = []
+    best_std = 0.0
+    for _ in range(max_frames):
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        frames.append(frame)
+        best_std = max(best_std, float(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).std()))
+        # Content seen: let auto-exposure settle a little longer, then go.
+        if best_std >= min_std and len(frames) >= 20:
+            return frames
+
+    if best_std < min_std:
+        last = frames[-1] if frames else None
+        mean_luma = float(cv2.cvtColor(last, cv2.COLOR_BGR2GRAY).mean()) if last is not None else 0.0
         raise BlankCameraError(
-            f"The camera is delivering blank frames (pixel spread {max(spreads):.2f}, "
-            f"mean brightness {mean_luma:.0f}). This is not a lighting or framing "
-            "problem — there is no image in the stream at all.\n"
+            f"The camera is delivering blank frames (best pixel spread {best_std:.2f} "
+            f"over {len(frames)} frames, mean brightness {mean_luma:.0f}). This is not "
+            "a lighting or framing problem — there is no image in the stream at all.\n"
             "Check, in order: a physical privacy shutter over the lens; a camera "
-            "kill switch (often an Fn key); Windows Settings > Privacy & security > "
-            "Camera > 'Let desktop apps access your camera'; and any other app "
-            "holding the camera."
+            "kill switch (often an Fn key); on a phone used as a webcam, a locked "
+            "or sleeping screen; Windows Settings > Privacy & security > Camera > "
+            "'Let desktop apps access your camera'; and any other app holding the "
+            "camera."
         )
+    return frames
 
 
 def capture(
@@ -277,17 +299,13 @@ def capture(
     is_file = not isinstance(source, int)
 
     if not is_file:
-        # Webcams need a moment for auto-exposure to settle; sampling before
-        # that would put a brightness ramp straight into the pulse band.
-        for _ in range(12):
-            ok, frame = cap.read()
-            if ok:
-                warmup.append(frame)
         try:
-            _check_frames_have_content(warmup)
+            warmup = _wait_for_stream(cap)
         except BlankCameraError:
             cap.release()
             raise
+        if progress:
+            print(f"  stream started after {len(warmup)} frames")
 
     started = time.perf_counter()
 
