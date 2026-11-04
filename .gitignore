@@ -15,7 +15,8 @@
 .cxx
 **/cmake-build-*/
 local.properties
-n__pycache__/n*.pyc
+__pycache__/
+*.pyc
 
 # Node / Vite dependencies
 node_modules/
