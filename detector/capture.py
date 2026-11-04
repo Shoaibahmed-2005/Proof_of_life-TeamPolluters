@@ -130,17 +130,57 @@ def list_cameras(max_index: int = 8) -> list[tuple[int, str]]:
     return found
 
 
-def _open(source: int | str):
+def _open(source: int | str, want_fps: float = 30.0, want_width: int = 1280):
     import cv2
 
     if isinstance(source, int):
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
         cap = cv2.VideoCapture(source, backend)
+        if cap.isOpened():
+            # Many USB webcams default to uncompressed YUY2, which the bus can
+            # only sustain at 15-16 fps. MJPG usually unlocks the full frame
+            # rate. Frame rate matters here: the pulse is sampled per frame, so
+            # half the frames is half the evidence in the same window.
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, want_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(want_width * 9 / 16))
+            cap.set(cv2.CAP_PROP_FPS, want_fps)
     else:
         cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source {source!r}")
     return cap
+
+
+class BlankCameraError(RuntimeError):
+    """The camera streams, but the frames carry no image."""
+
+
+def _check_frames_have_content(frames: list[np.ndarray], min_std: float = 2.0) -> None:
+    """
+    Rejects a stream of flat frames before wasting a whole capture on it.
+
+    A covered lens, a camera kill switch or a privacy setting all produce
+    frames that arrive on time and contain nothing. Without this check the
+    capture runs its full length and then blames the user's face or lighting,
+    which sends them looking in exactly the wrong place.
+    """
+    import cv2
+
+    if not frames:
+        return
+    spreads = [float(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).std()) for f in frames]
+    if max(spreads) < min_std:
+        mean_luma = float(cv2.cvtColor(frames[-1], cv2.COLOR_BGR2GRAY).mean())
+        raise BlankCameraError(
+            f"The camera is delivering blank frames (pixel spread {max(spreads):.2f}, "
+            f"mean brightness {mean_luma:.0f}). This is not a lighting or framing "
+            "problem — there is no image in the stream at all.\n"
+            "Check, in order: a physical privacy shutter over the lens; a camera "
+            "kill switch (often an Fn key); Windows Settings > Privacy & security > "
+            "Camera > 'Let desktop apps access your camera'; and any other app "
+            "holding the camera."
+        )
 
 
 def capture(
@@ -178,8 +218,23 @@ def capture(
     samples: list[tuple[float, dict[str, skin.RegionSample]]] = []
     frames_seen = 0
     face_lost = 0
-    started = time.perf_counter()
+    warmup: list[np.ndarray] = []
     is_file = not isinstance(source, int)
+
+    if not is_file:
+        # Webcams need a moment for auto-exposure to settle; sampling before
+        # that would put a brightness ramp straight into the pulse band.
+        for _ in range(12):
+            ok, frame = cap.read()
+            if ok:
+                warmup.append(frame)
+        try:
+            _check_frames_have_content(warmup)
+        except BlankCameraError:
+            cap.release()
+            raise
+
+    started = time.perf_counter()
 
     try:
         while True:
@@ -323,7 +378,11 @@ def _main(argv: list[str] | None = None) -> int:
     else:
         source: int | str = args.video if args.video else args.source
         print(f"Capturing from {source!r} for {args.seconds:.0f}s ...")
-        result = capture(source=source, seconds=args.seconds, show=args.show)
+        try:
+            result = capture(source=source, seconds=args.seconds, show=args.show)
+        except BlankCameraError as exc:
+            print(f"\n{exc}")
+            return 2
 
     print(result.summary())
     if result.dropped_regions:
