@@ -53,3 +53,9 @@ graphify-out/
 
 # Engram tool cache (local metadata, never committed)
 .engram/
+
+# Face-detection model (third-party binary, re-downloaded on first use)
+detector/models/
+
+# Captured calibration clips (may contain personal measurements)
+clips/

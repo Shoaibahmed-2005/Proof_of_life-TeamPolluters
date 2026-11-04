@@ -10,3 +10,4 @@ SQLAlchemy==2.0.36
 sqlmodel==0.0.48
 uvicorn==0.54.0
 websockets==17.3
+opencv-python>=4.10

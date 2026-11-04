@@ -70,9 +70,54 @@ thing that decides.
 |---|---|
 | `dsp.py` | DSP layer over the app's own rPPG reference; whole-window analysis, green channel, complex coefficients for phase |
 | `regions.py` | Where to sample: `INNER` (inside the swap mask), `OUTER` (neck/collar — the real person), `CONTROL` (off-skin) |
+| `skin.py` | Mean skin colour per region, a constant-for-constant port of the engine's `meanSkinRgb()` |
+| `faces.py` | Face tracking: YuNet detection, EMA smoothing, and coasting through missed frames |
+| `capture.py` | The camera front end — video in, a verdict out, plus the CLI |
 | `pulse_consistency.py` | The detector and its risk fusion |
 | `synth.py` | Synthetic multi-region scenarios — no camera, GPU or OBS needed |
-| `tests/` | 29 tests; more cover refusing-to-accuse than cover the attacks |
+| `tests/` | 41 tests; more cover refusing-to-accuse than cover the attacks |
+
+## Running it on a camera
+
+```bash
+python -m detector.capture --list-cameras
+```
+
+```bash
+python -m detector.capture --source 0 --seconds 20
+```
+
+```bash
+python -m detector.capture --source 1 --seconds 20 --save clips/swap_01.npz
+```
+
+A virtual camera appears in `--list-cameras` exactly like a physical webcam —
+which is itself the point: the application layer cannot tell them apart by
+reading frames, so the defence has to be physiological.
+
+`--save` writes the sampled time series, **not** the video. Those `.npz` files
+are what threshold calibration runs on, and they contain no images, so a
+capture can be shared for analysis without sharing anyone's face. Re-analyse
+one with `--load`.
+
+### Two notes on the capture loop
+
+**Box stability matters more than detector accuracy.** A face box that jitters
+drags the sampling rectangles across different skin and injects motion noise
+straight into the pulse band — the detector would then measure the tracker
+rather than the person. Hence the EMA smoothing and the dead zone in
+`faces.py`.
+
+**Frames are dropped, never interpolated.** All regions must share one
+timestamp vector, so only frames where every surviving region was valid are
+kept. Carrying a stale sample forward would invent signal that was never
+measured. A region measurable in fewer than 90% of frames is dropped entirely
+and reported, rather than silently compared against a complete one.
+
+OpenCV 5 removed `CascadeClassifier`, so the Haar cascades vendored in
+`sdk/etc/haarcascades/` for the Android build are not usable from Python. The
+front end uses YuNet instead, which gives markedly steadier boxes. The ~230 KB
+model downloads once into `detector/models/` and is not committed.
 
 ## Usage
 
@@ -119,8 +164,14 @@ structure.
 
 ## Not yet built
 
-This package currently covers the physiological pillar only. Still to come:
-the active screen-flash probe, blend-boundary and spectral forensics, camera
-provenance / virtual-device fingerprinting, the cross-detector risk fusion, and
-the frame-sampling front end that feeds real camera input into
-`analyze_regions`.
+This package covers the physiological pillar and its camera front end. Still
+to come: the active screen-flash probe, blend-boundary and spectral forensics,
+camera provenance / virtual-device fingerprinting, and the cross-detector risk
+fusion.
+
+**It has not yet been calibrated on real captures.** The pixel-level tests
+prove the chain works end to end on rendered frames; they do not tell you how
+it behaves on a real face in real light against a real face-swap tool. That
+needs roughly 30 genuine and 30 swapped clips through the actual capture path,
+collected with `--save` and then used to set the deficit, rate, phase and bleed
+thresholds.

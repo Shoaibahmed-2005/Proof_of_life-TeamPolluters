@@ -315,12 +315,19 @@ def analyze_regions(
     )
 
     # Illumination control: green-channel power off skin vs on skin.
-    skin_green = [
-        dsp.power_at(w.green, cfg.fs, ref_f0)
-        for w in list(inner.values()) + list(outer.values())
-        if w.green is not None and w.green.size
-    ]
-    skin_green_power = float(np.median(skin_green)) if skin_green else 0.0
+    #
+    # The baseline is the REFERENCE region, not an average across all skin.
+    # Averaging in the face regions would be self-defeating: a successful swap
+    # suppresses their pulse, which drags the baseline down, inflates the
+    # ratio, and fires ILLUMINATION_ARTIFACT — downgrading precisely the
+    # verdict the detector exists to make. The reference is the region we
+    # already trust to carry a real pulse, so it is the honest denominator.
+    # (Found by the pixel-level capture test, not by the synthetic one.)
+    skin_green_power = (
+        dsp.power_at(ref.green, cfg.fs, ref_f0)
+        if (ref.green is not None and ref.green.size)
+        else 0.0
+    )
     control_green = [
         dsp.power_at(w.green, cfg.fs, ref_f0)
         for w in control.values()
