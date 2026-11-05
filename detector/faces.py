@@ -107,6 +107,7 @@ class FaceTracker:
         smoothing: float = 0.35,
         dead_zone_px: float = 1.5,
         max_coast_frames: int = 20,
+        max_jump_fraction: float = 0.45,
         # 0.7 is a sensible floor when the cost of a wrong face is high. Here
         # the subject is cooperative and framed deliberately, while a rejected
         # frame is a hole in the pulse signal — so the cost is reversed. At
@@ -127,8 +128,13 @@ class FaceTracker:
         self.smoothing = float(smoothing)
         self.dead_zone_px = float(dead_zone_px)
         self.max_coast_frames = int(max_coast_frames)
+        self.max_jump_fraction = float(max_jump_fraction)
         self._state: np.ndarray | None = None  # smoothed [x, y, w, h]
         self._misses = 0
+
+    @staticmethod
+    def _centre(box: np.ndarray) -> np.ndarray:
+        return np.array([box[0] + box[2] / 2.0, box[1] + box[3] / 2.0])
 
     def reset(self) -> None:
         self._state = None
@@ -161,8 +167,33 @@ class FaceTracker:
             x, y, w, h = (int(round(v)) for v in self._state)
             return FaceBox(x, y, w, h, detected=False, frames_since_seen=self._misses)
 
-        # Largest face wins: the subject is nearest the camera.
-        best = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+        if self._state is None:
+            # First acquisition only: the largest face is the subject, being
+            # nearest the camera.
+            best = max(faces, key=lambda f: float(f[2]) * float(f[3]))
+        else:
+            # Afterwards, follow CONTINUITY rather than size. Picking the
+            # largest every frame lets the track flip between the real face
+            # and a lower-confidence false positive, and each flip throws the
+            # sampling regions onto completely different pixels. That showed
+            # up as the box wandering 395px while the subject sat still, with
+            # region brightness swinging 150 counts — against a pulse worth
+            # about one count.
+            previous = self._centre(self._state)
+            best = min(
+                faces, key=lambda f: float(np.hypot(*(self._centre(f) - previous)))
+            )
+            jump = float(np.hypot(*(self._centre(best) - previous)))
+            if jump > self.max_jump_fraction * float(self._state[2]):
+                # Nothing near where the face was. A real head cannot move
+                # that far between frames, so treat it as a miss and coast.
+                self._misses += 1
+                if self._misses > self.max_coast_frames:
+                    self._state = None
+                    return None
+                x, y, w, h = (int(round(v)) for v in self._state)
+                return FaceBox(x, y, w, h, detected=False, frames_since_seen=self._misses)
+
         measured = np.array(best[:4], dtype=float)
         score = float(best[14]) if len(best) > 14 else 0.0
         self._misses = 0

@@ -130,6 +130,29 @@ def list_cameras(max_index: int = 8) -> list[tuple[int, str]]:
     return found
 
 
+_ROTATIONS = {0: None, 90: "ROTATE_90_CLOCKWISE", 180: "ROTATE_180", 270: "ROTATE_90_COUNTERCLOCKWISE"}
+
+
+def _rotate(frame: np.ndarray, degrees: int) -> np.ndarray:
+    """
+    Turns a frame upright.
+
+    Every sampling rectangle is defined relative to an upright face — the
+    neck is *below* the face box, the background is *beside* it. A phone
+    propped in portrait streams a landscape image with the subject lying on
+    their side, which silently puts the neck region on the floor and the
+    background regions on the subject's own hair. Nothing downstream can
+    detect this: the face is still found, the regions still resolve, the
+    colours are still valid. They are simply the wrong pixels.
+    """
+    import cv2
+
+    name = _ROTATIONS.get(int(degrees) % 360)
+    if not name:
+        return frame
+    return cv2.rotate(frame, getattr(cv2, name))
+
+
 def _open(
     source: int | str,
     want_fps: float = 30.0,
@@ -263,6 +286,7 @@ def capture(
     compressed: bool = True,
     lock_exposure: bool = False,
     width: int = 1280,
+    rotate: int = 0,
 ) -> CaptureResult:
     """
     Samples region colour traces from a camera or a video file.
@@ -314,6 +338,8 @@ def capture(
             ok, frame = cap.read()
             if not ok:
                 break  # end of file, or camera went away
+            if rotate:
+                frame = _rotate(frame, rotate)
             frames_seen += 1
             now = time.perf_counter() - started
             if is_file:
@@ -437,6 +463,11 @@ def _main(argv: list[str] | None = None) -> int:
         help="skip MJPG: lower frame rate, but no lossy chroma compression",
     )
     parser.add_argument(
+        "--rotate", type=int, default=0, choices=[0, 90, 180, 270],
+        help="rotate frames clockwise to put the subject upright; a phone "
+             "propped in portrait needs 90 or 270",
+    )
+    parser.add_argument(
         "--width", type=int, default=1280,
         help="capture width; 640 often trades resolution for a higher frame "
              "rate, which rPPG values more",
@@ -469,7 +500,7 @@ def _main(argv: list[str] | None = None) -> int:
             result = capture(
                 source=source, seconds=args.seconds, show=args.show,
                 compressed=not args.raw, lock_exposure=args.lock_exposure,
-                width=args.width,
+                width=args.width, rotate=args.rotate,
             )
         except BlankCameraError as exc:
             print(f"\n{exc}")
