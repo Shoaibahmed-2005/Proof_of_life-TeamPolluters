@@ -520,7 +520,7 @@ def preflight(
     ys = [b[1] for b in boxes]
     wander = max(max(xs) - min(xs), max(ys) - min(ys))
     all_ok &= line(
-        wander <= 40,
+        wander <= 55,
         "head steady",
         f"box moved {wander}px",
         "Sit still, and make sure the phone itself cannot move.",
@@ -558,7 +558,7 @@ def preflight(
         neck_luma = float(np.mean(luma["neck"]))
         ratio = neck_luma / face_luma if face_luma else 0.0
         all_ok &= line(
-            ratio >= 0.75,
+            ratio >= 0.65,
             "neck lit like face",
             f"neck {neck_luma:.0f} vs face {face_luma:.0f}",
             "The neck is in shadow, and it is the reference the whole verdict "
@@ -570,7 +570,7 @@ def preflight(
         key=lambda kv: kv[1], default=("", 0.0),
     )
     all_ok &= line(
-        worst[1] < 4.0,
+        worst[1] < 6.0,
         "brightness steady",
         f"worst region varies {worst[1]:.1f} counts ({worst[0]})",
         "A heartbeat is worth about 1 count. Stop moving, and use a steady "

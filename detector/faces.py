@@ -104,8 +104,13 @@ class FaceTracker:
 
     def __init__(
         self,
-        smoothing: float = 0.35,
-        dead_zone_px: float = 1.5,
+        # A seated subject barely moves, so the box should barely move. Heavy
+        # smoothing lags a person settling into frame by a fraction of a
+        # second and is worth it: residual box wander drags the sampling
+        # rectangles across different skin, and that drift is far larger than
+        # the one-count signal being measured.
+        smoothing: float = 0.18,
+        dead_zone_px: float = 2.5,
         max_coast_frames: int = 20,
         max_jump_fraction: float = 0.45,
         # 0.7 is a sensible floor when the cost of a wrong face is high. Here

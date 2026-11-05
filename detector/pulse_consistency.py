@@ -123,6 +123,9 @@ class Thresholds:
     # Control-region green power above this fraction of skin green power means
     # the light is doing the pulsing.
     control_bleed_ratio: float = 0.45
+    # How close an off-skin region's own rate must be to the reference rate
+    # before we conclude the rhythm is the lighting rather than a pulse.
+    control_rate_match_bpm: float = 4.0
 
     # ── Pulse deficit (face vs the rate the neck is beating at) ──────────
     deficit_warn_db: float = 3.0
@@ -284,18 +287,95 @@ def analyze_regions(
             regions=_regions(0.0, 0.0),
         )
 
-    ref_name = max(outer, key=lambda n: outer[n].snr_db)
-    ref = outer[ref_name]
-    ref_f0, ref_hw = ref.f0_hz, ref.half_width_hz
+    # ── The reference rate, by consensus across the off-mask regions ────
+    #
+    # Taking the single strongest outer region's own peak lets one noisy
+    # region decide the body's heart rate: in a real capture the neck picked
+    # 61.8 BPM while the collar, both ears and every face region agreed on
+    # 78. Everything downstream is then compared against a rate nobody has.
+    #
+    # Instead, sum the outer regions' power spectra — each normalised first,
+    # so a loud noisy region cannot outvote the others — and take the peak of
+    # the sum. Adding power rather than signal means regions reinforce a
+    # shared rhythm without cancelling on phase differences, and a rate
+    # several regions agree on survives while one region's noise does not.
+    ref_f0 = 0.0
+    ref_hw = 0.0
+    pooled: np.ndarray | None = None
+    freqs: np.ndarray | None = None
+    for w in outer.values():
+        if w.signal is None or w.signal.size < 4:
+            continue
+        f, power = dsp.band_spectrum(
+            w.signal, cfg.fs, cfg.band_low_hz, cfg.band_high_hz, cfg.spectrum_step_bpm / 60.0
+        )
+        total = float(np.sum(power))
+        if total <= 0:
+            continue
+        pooled = power / total if pooled is None else pooled + power / total
+        freqs = f
+        ref_hw = max(ref_hw, w.half_width_hz)
 
-    if ref.snr_db < th.min_reference_snr_db:
+    if pooled is not None and freqs is not None:
+        ref_f0 = dsp.peak_frequency(freqs, pooled)
+
+    if ref_f0 <= 0:  # nothing usable; fall back to the strongest region's own peak
+        fallback = max(outer, key=lambda n: outer[n].snr_db)
+        ref_f0, ref_hw = outer[fallback].f0_hz, outer[fallback].half_width_hz
+
+    # The reporting reference is whichever off-mask region carries that
+    # agreed rate most strongly; it supplies the phase and the green-channel
+    # baseline.
+    ref_name = max(outer, key=lambda n: dsp.snr_at(outer[n].signal, cfg, ref_f0, ref_hw))
+    ref = outer[ref_name]
+
+    # Strength of the agreed rate where it is carried best, not the strength
+    # of whatever peak one region happened to have.
+    ref_snr_db = dsp.snr_at(ref.signal, cfg, ref_f0, ref_hw)
+    ref_bpm = ref_f0 * 60.0
+
+    # Before blaming the measurement, check whether the rhythm is in the room.
+    # Off-skin regions contain no blood, so a control region beating at the
+    # same rate as the skin means a flickering lamp or a hunting exposure has
+    # landed in the pulse band. This is the most dangerous failure in rPPG,
+    # because it looks like a strong pulse agreed across many regions — and
+    # without this check it would be reported as one.
+    # Require EVERY control region to agree, and at least two of them. A
+    # flickering lamp lights the whole scene, so it shows up in all of them;
+    # one region's noisy peak landing near the reference rate is chance, and
+    # treating that as an artifact would suppress real verdicts — it broke a
+    # face-swap detection test when this check accepted a single match.
+    control_match = [
+        n for n, w in control.items()
+        if ref_f0 > 0 and abs(w.bpm - ref_bpm) <= th.control_rate_match_bpm
+    ]
+    if len(control) >= 2 and len(control_match) == len(control):
+        names = " and ".join(sorted(control_match))
+        return PulseConsistencyResult(
+            verdict=Verdict.INCONCLUSIVE, score=0.0,
+            reason_codes=[ILLUMINATION_ARTIFACT],
+            reasons=[
+                f"The rhythm is in the light, not in the person: the off-skin "
+                f"{names} region is beating at {ref_bpm:.0f} BPM, the same rate as the "
+                "skin. There is no blood in a background, so this is a flickering lamp "
+                "or an exposure that is hunting.",
+                "Switch to daylight or an incandescent bulb. LED and fluorescent lamps "
+                "flicker, and dimmed LEDs flicker worst; the beat against the camera's "
+                "frame rate can land squarely in the human pulse band.",
+            ],
+            metrics={"reference_snr_db": ref_snr_db, "reference_bpm": ref_bpm},
+            regions=_regions(ref_f0, ref_hw),
+            reference_region=ref_name,
+        )
+
+    if ref_snr_db < th.min_reference_snr_db:
         return PulseConsistencyResult(
             verdict=Verdict.INCONCLUSIVE, score=0.0,
             reason_codes=[PULSE_REFERENCE_WEAK],
             reasons=[f"The reference pulse at the {ref_name} is too weak to compare "
-                     f"against ({ref.snr_db:.1f} dB, need {th.min_reference_snr_db:.1f} dB). "
+                     f"against ({ref_snr_db:.1f} dB, need {th.min_reference_snr_db:.1f} dB). "
                      "Usually lighting, framing or movement - not an attack."],
-            metrics={"reference_snr_db": ref.snr_db},
+            metrics={"reference_snr_db": ref_snr_db, "reference_bpm": ref_bpm},
             regions=_regions(ref_f0, ref_hw),
             reference_region=ref_name,
         )
@@ -308,8 +388,8 @@ def analyze_regions(
     inner_own_snr = inner[strongest_inner].snr_db
     inner_own_bpm = inner[strongest_inner].bpm
 
-    snr_deficit_db = ref.snr_db - inner_snr_at_ref
-    bpm_disagreement = abs(inner_own_bpm - ref.bpm)
+    snr_deficit_db = ref_snr_db - inner_snr_at_ref
+    bpm_disagreement = abs(inner_own_bpm - ref_bpm)
     phase_deg = dsp.phase_difference_deg(
         inner[strongest_inner].signal, ref.signal, cfg.fs, ref_f0
     )
@@ -352,8 +432,8 @@ def analyze_regions(
             codes.append(FACE_PULSE_ABSENT)
             reasons.append(
                 f"The face carries no blood-volume pulse at the rate the body is beating "
-                f"at ({ref.bpm:.0f} BPM): {inner_snr_at_ref:.1f} dB in the face versus "
-                f"{ref.snr_db:.1f} dB at the {ref_name}."
+                f"at ({ref_bpm:.0f} BPM): {inner_snr_at_ref:.1f} dB in the face versus "
+                f"{ref_snr_db:.1f} dB at the {ref_name}."
             )
         else:
             codes.append(FACE_PULSE_WEAK)
@@ -369,7 +449,7 @@ def analyze_regions(
             codes.append(PULSE_BPM_DISAGREEMENT)
             reasons.append(
                 f"Two different heart rates in one frame: the face beats at "
-                f"{inner_own_bpm:.0f} BPM while the {ref_name} beats at {ref.bpm:.0f} BPM "
+                f"{inner_own_bpm:.0f} BPM while the {ref_name} beats at {ref_bpm:.0f} BPM "
                 f"({bpm_disagreement:.0f} BPM apart)."
             )
             if bpm_disagreement >= th.bpm_bad and inner_own_snr >= 4.0:
@@ -418,7 +498,7 @@ def analyze_regions(
 
     if verdict is Verdict.LIVE and not codes:
         reasons.append(
-            f"The face and the {ref_name} share one pulse at {ref.bpm:.0f} BPM, in phase "
+            f"The face and the {ref_name} share one pulse at {ref_bpm:.0f} BPM, in phase "
             f"to within {phase_deg:.0f} degrees. Consistent with a single living body."
         )
 
@@ -428,8 +508,8 @@ def analyze_regions(
         reason_codes=codes,
         reasons=reasons,
         metrics={
-            "reference_bpm": ref.bpm,
-            "reference_snr_db": ref.snr_db,
+            "reference_bpm": ref_bpm,
+            "reference_snr_db": ref_snr_db,
             "inner_snr_at_reference_db": inner_snr_at_ref,
             "inner_own_snr_db": inner_own_snr,
             "inner_own_bpm": inner_own_bpm,
