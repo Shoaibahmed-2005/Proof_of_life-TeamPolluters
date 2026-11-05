@@ -438,6 +438,157 @@ def capture(
     )
 
 
+def preflight(
+    source: int | str = 0,
+    rotate: int = 0,
+    frames: int = 120,
+    width: int = 1280,
+) -> bool:
+    """
+    Four seconds of checks before committing to a real capture.
+
+    Every failure mode hit while building this was physical — a sideways
+    phone, a shadowed neck, a subject who moved — and each one only showed up
+    after a full capture had been spent on it. This reports each condition
+    separately with the number behind it, so the fix is obvious rather than
+    guessed at.
+
+    Returns True if the setup is ready.
+    """
+    import cv2
+
+    cap = _open(source, want_width=width)
+    try:
+        _wait_for_stream(cap)
+    except BlankCameraError as exc:
+        cap.release()
+        print(f"\n{exc}")
+        return False
+
+    tracker = FaceTracker()
+    roles = roles_for()
+    boxes: list[tuple[int, int, int, int]] = []
+    seen: dict[str, int] = {}
+    luma: dict[str, list[float]] = {}
+    skin_frac: dict[str, list[float]] = {}
+    tracked = 0
+
+    for _ in range(frames):
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        if rotate:
+            frame = _rotate(frame, rotate)
+        box = tracker.update(frame)
+        if box is None:
+            continue
+        tracked += 1
+        boxes.append(box.as_tuple())
+        rects = resolve_regions(box.as_tuple(), frame.shape[1], frame.shape[0])
+        ycrcb = skin.to_ycrcb(frame)
+        for name, rect in rects.items():
+            s = skin.sample_region(ycrcb, rect)
+            if s.valid:
+                seen[name] = seen.get(name, 0) + 1
+                luma.setdefault(name, []).append(s.luma)
+                skin_frac.setdefault(name, []).append(s.skin_fraction)
+    cap.release()
+
+    def line(ok: bool, label: str, detail: str, fix: str = "") -> bool:
+        mark = "PASS" if ok else "FIX "
+        print(f"  [{mark}] {label:26s} {detail}")
+        if not ok and fix:
+            print(f"         -> {fix}")
+        return ok
+
+    print("\nPre-flight")
+    print("-" * 66)
+    all_ok = True
+
+    all_ok &= line(
+        tracked >= frames * 0.9,
+        "face tracked",
+        f"{tracked}/{frames} frames",
+        "Move so your whole head is in frame and hold still.",
+    )
+    if not boxes:
+        print("-" * 66)
+        print("  NOT READY - no face found at all.")
+        return False
+
+    xs = [b[0] for b in boxes]
+    ys = [b[1] for b in boxes]
+    wander = max(max(xs) - min(xs), max(ys) - min(ys))
+    all_ok &= line(
+        wander <= 40,
+        "head steady",
+        f"box moved {wander}px",
+        "Sit still, and make sure the phone itself cannot move.",
+    )
+
+    face_luma = float(np.mean([v for n in ("forehead", "cheek_left", "cheek_right")
+                               for v in luma.get(n, [])])) if luma else 0.0
+
+    # Rotation sanity: background regions must NOT be skin.
+    bg_skin = [np.mean(skin_frac[n]) for n in skin_frac if roles[n] is RegionRole.CONTROL]
+    all_ok &= line(
+        bool(bg_skin) and max(bg_skin) < 0.4,
+        "image upright",
+        f"background is {100 * max(bg_skin):.0f}% skin" if bg_skin else "no control region",
+        "Background should not be skin. Your phone is probably sideways - "
+        "add --rotate 90 (or 270).",
+    )
+
+    neck_seen = seen.get("neck", 0)
+    all_ok &= line(
+        neck_seen >= tracked * 0.9,
+        "neck in frame",
+        f"{neck_seen}/{tracked} frames",
+        "Move back or tilt the camera up until your neck and collarbone show.",
+    )
+
+    if neck_seen:
+        neck_skin = float(np.mean(skin_frac["neck"]))
+        all_ok &= line(
+            neck_skin >= 0.5,
+            "neck is bare skin",
+            f"{100 * neck_skin:.0f}% skin",
+            "The neck box is on clothing or beard. Lift your chin or lower your collar.",
+        )
+        neck_luma = float(np.mean(luma["neck"]))
+        ratio = neck_luma / face_luma if face_luma else 0.0
+        all_ok &= line(
+            ratio >= 0.75,
+            "neck lit like face",
+            f"neck {neck_luma:.0f} vs face {face_luma:.0f}",
+            "The neck is in shadow, and it is the reference the whole verdict "
+            "depends on. Angle the lamp down towards your chin.",
+        )
+
+    worst = max(
+        ((n, float(np.std(v))) for n, v in luma.items() if roles[n] is not RegionRole.CONTROL),
+        key=lambda kv: kv[1], default=("", 0.0),
+    )
+    all_ok &= line(
+        worst[1] < 4.0,
+        "brightness steady",
+        f"worst region varies {worst[1]:.1f} counts ({worst[0]})",
+        "A heartbeat is worth about 1 count. Stop moving, and use a steady "
+        "lamp rather than a window or a screen.",
+    )
+
+    all_ok &= line(
+        60 <= face_luma <= 200,
+        "exposure sensible",
+        f"face luma {face_luma:.0f}",
+        "Too dark or blown out. Adjust the lamp distance.",
+    )
+
+    print("-" * 66)
+    print("  READY - run the capture." if all_ok else "  NOT READY - fix the lines marked FIX above.")
+    return bool(all_ok)
+
+
 def analyze_capture(
     result: CaptureResult,
     cfg: dsp.Config | None = None,
@@ -478,6 +629,10 @@ def _main(argv: list[str] | None = None) -> int:
              "support manual control, and check the reported auto_exposure",
     )
     parser.add_argument("--list-cameras", action="store_true", help="list openable cameras and exit")
+    parser.add_argument(
+        "--preflight", action="store_true",
+        help="four-second setup check: framing, neck, lighting, stillness",
+    )
     args = parser.parse_args(argv)
 
     if args.list_cameras:
@@ -489,6 +644,10 @@ def _main(argv: list[str] | None = None) -> int:
         for index, name in found:
             print(f"  --source {index}    {name}")
         return 0
+
+    if args.preflight:
+        source = args.video if args.video else args.source
+        return 0 if preflight(source, rotate=args.rotate, width=args.width) else 1
 
     if args.load:
         result = CaptureResult.load(args.load)
